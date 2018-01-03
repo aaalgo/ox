@@ -3,6 +3,7 @@
 #include <atomic>
 #include <mutex>
 #include <iostream>
+#include <fstream>
 #include <vector>
 #include <memory>
 #include <boost/thread/shared_mutex.hpp>
@@ -13,9 +14,12 @@
 
 namespace ox {
 
+    using std::cout;
+    using std::cerr;
     using std::atomic;
     using std::endl;
     using std::ostream;
+    using std::ofstream;
     using std::vector;
     using std::memcpy;
     using std::string;
@@ -47,7 +51,7 @@ namespace ox {
             uint32_t version;
             // config
             uint32_t page_size;
-            uint32_t max_pages;
+            uint32_t max_pages;     // need this to allocate bitmap
             uint32_t max_buckets;
 
             // global counters
@@ -101,6 +105,12 @@ namespace ox {
         };
 
     private:
+        // disk layout
+        // 1 super page
+        // 1 super page
+        // bitmap pages
+        // index pages
+        // bucket pages
         struct Geometry: public Config {
             uint32_t bitmap_pages;
             uint32_t index_pages;
@@ -220,9 +230,9 @@ namespace ox {
         };
 
         struct Bucket {
-            uint32_t head;  // 0 means empty, otherwise the head page of the bucket
-            Page page;      // content of the head page
-            //string buf;     // buffer of the head page
+            uint32_t head;      // 0 means empty, otherwise the head page of the bucket
+            Page page;          // content of the head page
+            //string buf;       // buffer of the head page
             bool dirty;
             std::shared_timed_mutex mutex;
 
@@ -269,5 +279,401 @@ namespace ox {
         // scan a bucket, can be concurrent
         void scan (uint32_t bid, function<char const *(char const *buf)> callback);
     };
+
+    class Journal {
+        static constexpr uint32_t MAX_RECORD_SIZE = (1 << 16)-1;
+        struct __attribute__ ((__packed__)) Head {
+            static constexpr uint64_t MAGIC = 0x59AE59AE59AE59AE;
+            static constexpr uint32_t VERSION = 1;
+            static constexpr uint32_t HEAD_SIZE = 512;
+            static constexpr uint32_t PAD_SIZE = 512 - 32;
+            uint64_t magic;
+            uint32_t version;
+            uint32_t serial;
+            uint64_t file_size;
+            uint64_t last_index;
+            char pad[PAD_SIZE];
+        };
+
+        string path;            // path to journal file
+        ofstream str;            // use buffer of stream
+        Head head;
+        std::mutex mutex;
+
+        struct __attribute__ ((__packed__)) RecordHead {
+            static constexpr uint16_t MAGIC = 0x59AF;
+            uint16_t magic;
+            uint16_t size;
+            uint32_t serial;
+            //uint16_t meta_size;
+        };
+
+        /*
+        struct __attribute__ ((__packed__)) IndexHead {
+            static constexpr uint16_t MAGIC = 0x59B0;
+            uint16_t magic;
+            uint16_t size;
+            uint32_t serial;
+            //uint64_t previous;
+            //uint16_t meta_size;
+        };
+        */
+
+    public:
+        static void create (string const &path); 
+        static void replay (string const &path);
+        Journal (string const &path_, bool trunc = true);
+        ~Journal ();
+        void append (uint32_t size, char const *buf);
+        void sync ();
+        //void replay ();
+    };
+
+    class DB {
+        Journal journal;
+        HashTable hash;
+    public:
+    };
+#if 0
+    class DB {
+        struct Record {
+            string key;
+            string meta;
+            Object object;
+        };
+        vector<Record *> records;
+        Index *index;
+        mutable shared_mutex mutex;
+        Matcher matcher;
+        SearchRequest defaults;
+        int default_K;
+        float default_R;
+    public:
+        DB (Config const &config, bool ro) 
+            : index(nullptr),
+            matcher(config),
+            default_K(config.get<int>("donkey.defaults.K", 1)),
+            default_R(config.get<float>("donkey.defaults.R", donkey::default_R()))
+        {
+            if (default_K <= 0) throw ConfigError("invalid defaults.K");
+            if (!isnormal(default_R)) throw ConfigError("invalid defaults.R");
+
+#ifdef AAALGO_DONKEY_TEXT
+            string algo = config.get<string>("donkey.index.algorithm", "inverted");
+#else
+            string algo = config.get<string>("donkey.index.algorithm", "kgraph");
+#endif
+            if (algo == "linear") {
+                index = create_linear_index(config);
+            }
+            else if (algo == "lsh") {
+                index = create_lsh_index(config);
+            }
+            else if (algo == "kgraph") {
+                index = create_kgraph_index(config);
+            }
+#ifdef AAALGO_DONKEY_TEXT
+            else if (algo == "inverted") {
+                index = create_inverted_index(config);
+            }
+#endif
+            else throw ConfigError("unknown index algorithm");
+            BOOST_VERIFY(index);
+        }
+
+        ~DB () {
+            clear();
+            delete index;
+        }
+
+        void insert (string const &key, string const &meta, Object *object) {
+            Record *rec = new Record;
+            rec->key = key;
+            rec->meta = meta;
+            object->swap(rec->object);
+            unique_lock<shared_mutex> lock(mutex);
+            size_t id = records.size();
+            records.push_back(rec);
+            rec->object.enumerate([this, id](unsigned tag, Feature const *ft) {
+                index->insert(id, tag, ft);
+            });
+        }
+
+        void search (Object const &object, SearchRequest const &params, SearchResponse *response) const {
+            unordered_map<unsigned, Candidate> candidates;
+            {
+                Timer timer(&response->filter_time);
+                shared_lock<shared_mutex> lock(mutex);
+                object.enumerate([this, &params, &candidates](unsigned qtag, Feature const *ft) {
+                    vector<Index::Match> matches;
+                    index->search(*ft, params, &matches);
+                    for (auto const &m: matches) {
+                        auto &c = candidates[m.object];
+                        Hint hint;
+                        hint.dtag = m.tag;
+                        hint.qtag = qtag;
+                        hint.value = m.distance;
+                        c.hints.push_back(hint);
+                    }
+                });
+            }
+            {
+                Timer timer(&response->rank_time);
+                response->hits.clear();
+                float R = params.R;
+                if (!std::isnormal(R)) {
+                    R = default_R;
+                }
+
+                int K = params.K;
+                if (K <= 0) {
+                    K = default_K;
+                }
+
+                for (auto &pair: candidates) {
+                    unsigned id = pair.first;
+                    Candidate &cand = pair.second;
+                    cand.object = &records[id]->object;
+                    string details;
+                    float score = matcher.apply(object, cand, &details);
+                    bool good = false;
+                    if (Matcher::POLARITY >= 0) {
+                        good = score >= R;
+                    }
+                    else {
+                        good = score <= R;
+                    }
+                    if (good) {
+                        Hit hit;
+                        hit.key = records[id]->key;
+                        hit.meta = records[id]->meta;
+                        hit.score = score;
+                        hit.details.swap(details);
+                        response->hits.push_back(hit);
+                    }
+                }
+                if (Matcher::POLARITY < 0) {
+                    sort(response->hits.begin(),
+                         response->hits.end(),
+                         [](Hit const &h1, Hit const &h2) { return h1.score < h2.score;});
+                }
+                else {
+                    sort(response->hits.begin(),
+                         response->hits.end(),
+                         [](Hit const &h1, Hit const &h2) { return h1.score > h2.score;});
+                }
+                if (response->hits.size() > K) {
+                    response->hits.resize(K);
+                }
+            }
+        }
+
+        void clear () {
+            unique_lock<shared_mutex> lock(mutex);
+            index->clear();
+            for (auto record: records) {
+                delete record;
+            }
+            records.clear();
+        }
+
+        void reindex () {
+            unique_lock<shared_mutex> lock(mutex);
+            // TODO: this can be improved
+            // The index building part doesn't requires read-lock only
+            index->rebuild();
+        }
+
+        void snapshot_index (string const &path) {
+            unique_lock<shared_mutex> lock(mutex);
+            if (records.size()) {
+                index->snapshot(path);
+            }
+        }
+
+        void recover_index (string const &path) {
+            unique_lock<shared_mutex> lock(mutex);
+            if (records.size()) {
+                index->recover(path);
+            }
+        }
+    };
+
+    struct ExtractResponse {
+        double time;
+        Object object;
+    };
+
+    class Service {
+    public:
+        virtual ~Service () = default;
+        virtual void ping (PingResponse *response) = 0;
+        virtual void insert (InsertRequest const &request, InsertResponse *response) = 0;
+        virtual void search (SearchRequest const &request, SearchResponse *response) = 0;
+        virtual void misc (MiscRequest const &request, MiscResponse *response) = 0;
+        virtual void extract (ExtractRequest const &request, ExtractResponse *response) {
+            throw Error("unimplemented");
+        };
+    };
+
+    class Server: public Service {
+        class dir_checker {
+        public:
+            dir_checker (string const &dir) {
+                int v = ::mkdir(dir.c_str(), 0777);
+                if (v && (errno != EEXIST)) {
+                    LOG(error) << "Root director " << dir << " does not exist and cannot be created.";
+                    BOOST_VERIFY(0);
+                }
+            }
+        };
+        bool readonly;
+        bool log_object;
+        string root;
+        dir_checker __dir_checker;
+        Journal journal;
+        vector<DB *> dbs;
+        Extractor xtor;
+
+        void check_dbid (uint16_t dbid) const {
+            BOOST_VERIFY(dbid < dbs.size());
+        }
+
+        void loadObject (ObjectRequest const &request, Object *object) const; 
+
+    public:
+        Server (Config const &config, bool ro = false)
+            : readonly(ro),
+            log_object(config.get<int>("donkey.server.log_object", 0)),
+            root(config.get<string>("donkey.root")),
+            __dir_checker(root),
+            journal(root + "/journal", ro),
+            dbs(config.get<size_t>("donkey.max_dbs", DEFAULT_MAX_DBS), nullptr),
+            xtor(config)
+        {
+            // create empty dbs
+            for (auto &db: dbs) {
+                db = new DB(config, readonly);
+            }
+            // recover journal 
+            journal.recover([this](uint16_t dbid, string const &key, string const &meta, Object *object){
+                try {
+                    dbs[dbid]->insert(key, meta, object);
+                }
+                catch (...) {
+                }
+            });
+            // reindex all dbs
+            for (unsigned i = 0; i < dbs.size(); ++i) {
+                dbs[i]->recover_index(format("%s/%d.index", root, i));
+            }
+        }
+
+        ~Server () { // close all dbs
+            for (DB *db: dbs) {
+                delete db;
+            }
+        }
+
+        // embedded mode
+        void ping (PingResponse *resp) {
+            resp->last_start_time = 0;
+            resp->first_start_time = 0;
+            resp->restart_count = 0;
+        }
+
+        void extract (ExtractRequest const &request, ExtractResponse *response) {
+            Timer timer1(&response->time);
+            loadObject(request, &response->object);
+        }
+
+        void insert (InsertRequest const &request, InsertResponse *response) {
+            if (readonly) throw PermissionError("readonly journal");
+            Timer timer(&response->time);
+            if (log_object) log_object_request(request, "INSERT");
+            check_dbid(request.db);
+            Object object;
+            {
+                Timer timer1(&response->load_time);
+                loadObject(request, &object);
+            }
+            {
+                Timer timer2(&response->journal_time);
+                journal.append(request.db, request.key, request.meta, object);
+            }
+            {
+                Timer timer3(&response->index_time);
+                // must come after journal, as db insert could change object content
+                dbs[request.db]->insert(request.key, request.meta, &object);
+            }
+        }
+
+        void search (SearchRequest const &request, SearchResponse *response) {
+            Timer timer(&response->time);
+            if (log_object) log_object_request(request, "SEARCH");
+            check_dbid(request.db);
+            Object object;
+            {
+                Timer timer1(&response->load_time);
+                loadObject(request, &object);
+            }
+            dbs[request.db]->search(object, request, response);
+        }
+
+        void misc (MiscRequest const &request, MiscResponse *response) {
+            LOG(info) << "misc operation: " << request.method;
+            if (request.method == "reindex") {
+                check_dbid(request.db);
+                dbs[request.db]->reindex();
+            }
+            else if (request.method == "clear") {
+                if (readonly) throw PermissionError("readonly journal");
+                check_dbid(request.db);
+                dbs[request.db]->clear();
+            }
+            else if (request.method == "sync") {
+                if (readonly) throw PermissionError("readonly journal");
+                journal.sync();
+                for (unsigned i = 0; i < dbs.size(); ++i) {
+                    dbs[i]->snapshot_index(format("%s/%d.index", root, i));
+                }
+            }
+            response->code = 0;
+        }
+    };
+
+    // true: reload
+    // false: exit
+    bool run_server (Config const &, Service *);
+
+    class NetworkAddress {
+        string h;   // empty for nothing 
+        int p;      // -1 for nothing
+    public:
+        NetworkAddress (string const &);
+        string host () const {
+            if (h.empty()) throw InternalError("no host");
+            return h;
+        }
+        int port () const {
+            if (p <= 0) throw InternalError("no port");
+            return p;
+        }
+        string host (string const &def) {
+            if (h.size()) return h;
+            return def;
+        }
+        unsigned short port (unsigned short def) const {
+            if (p > 0) return p;
+            return def;
+        }
+    };
+
+    Service *make_client (Config const &);
+    Service *make_client (string const &address);
+
+#endif
+
+
 }
 

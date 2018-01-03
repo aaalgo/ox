@@ -2,8 +2,10 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include "ox.h"
+#include "fnhack.h"
 
 namespace ox {
+    using std::ios;
     using boost::shared_lock;
     using boost::upgrade_lock;
 
@@ -190,6 +192,79 @@ namespace ox {
         super.next_bucket = next_bucket;
         r = ::pwrite(fd, &super, sizeof(super), geom.page_offset(0));
         CHECK(r == sizeof(super));
+    }
+
+    void Journal::create (string const &path) {
+        Head head;
+        CHECK(sizeof(head) == Head::HEAD_SIZE);
+        head.magic = Head::MAGIC;
+        head.version = Head::VERSION;
+        head.serial = 0;
+        head.file_size = sizeof(head);
+        head.last_index = 0;
+        std::fill(head.pad, head.pad + Head::PAD_SIZE, 0);
+        ofstream os(path.c_str(), ios::binary);
+        os.write(reinterpret_cast<char const *>(&head), sizeof(head));
+        CHECK(os);
+    }
+
+    Journal::Journal (string const &path_, bool trunc)
+              : path(path_)
+    {
+        uint64_t sz = 0;
+        {   // read journal
+            std::ifstream is(path.c_str(), ios::binary);
+            CHECK(is);
+            is.seekg(0, ios::end);
+            sz = is.tellg();
+            CHECK(sz >= Head::HEAD_SIZE);
+            is.seekg(0, ios::beg);
+            is.read(reinterpret_cast<char *>(&head), sizeof(head));
+            CHECK(is);
+        }
+        CHECK(head.magic == Head::MAGIC);
+        CHECK(head.version == Head::VERSION);
+        CHECK(sz >= head.file_size);
+        if (sz > head.file_size) {
+            CHECK(trunc) << "journal not clean, open with trunc = true";
+            LOG(WARNING) << "truncating journal to " << head.file_size << " bytes.";
+            int fd = ::open(path.c_str(), O_WRONLY);
+            CHECK(fd >= 0);
+            int r = ::ftruncate(fd, head.file_size);
+            CHECK(r == 0);
+            close(fd);
+        }
+        str.open(path.c_str(), ios::binary);
+        str.seekp(0, ios::end);
+    }
+
+    Journal::~Journal () {
+        if (str.is_open()) {
+            sync();
+        }
+    }
+
+    void Journal::append (uint32_t size, char const *buf) {
+        CHECK(size <= MAX_RECORD_SIZE);
+        std::lock_guard<std::mutex> lock(mutex); 
+        CHECK(str.is_open());
+        RecordHead rhead;
+        rhead.magic = RecordHead::MAGIC;
+        rhead.size = size;
+        rhead.serial = head.serial++;
+        str.write(reinterpret_cast<char const *>(&rhead), sizeof(rhead));
+        str.write(buf, size);
+        head.file_size += sizeof(rhead) + size;
+    }
+
+    void Journal::sync () {
+        CHECK(str.is_open());
+        std::lock_guard<std::mutex> lock(mutex); 
+        str.seekp(0, ios::beg);
+        str.write(reinterpret_cast<char const *>(&head), sizeof(head));
+        str.seekp(0, ios::end);
+        str.flush();
+        ::fsync(fileno_hack(str));
     }
 }
 
